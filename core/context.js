@@ -23,7 +23,21 @@ const STOPWORDS = new Set([
   "the","a","an","is","to","of","in","on","for","and","or","but","with",
   "this","that","what","how","why","please","can","you","do","i","it",
   "my","me","we","us","fix","add","make","change","update","help","build",
-  "create","remove","delete","show","tell","explain","why","when","where"
+  "create","remove","delete","show","tell","explain","why","when","where",
+  "want","read","whole","codebase","code","project","understand","analyze",
+  "look","check","review","know","about","like","just","really"
+])
+
+const PRIORITY_FILES = new Set([
+  "readme.md", "readme", "readme.txt",
+  "package.json", "tsconfig.json", "jsconfig.json",
+  "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
+  "cargo.toml", "go.mod", "gemfile", "composer.json",
+  "next.config.js", "next.config.mjs", "next.config.ts",
+  "vite.config.js", "vite.config.ts",
+  "webpack.config.js", "rollup.config.js",
+  "tailwind.config.js", "tailwind.config.ts",
+  ".env.example"
 ])
 
 const MAX_FILE_BYTES = 200_000
@@ -71,14 +85,11 @@ export async function getProjectContext(cwd, query) {
     .split(/[^a-z0-9_]+/)
     .filter(w => w.length > 2 && !STOPWORDS.has(w))
 
-  const tree = rels.slice(0, TREE_LIMIT)
-    .map(r => `- ${r}`)
-    .join("\n")
-  const treeHeader = `PROJECT FILE TREE (${rels.length} files, showing ${tree ? Math.min(rels.length, TREE_LIMIT) : 0}):\n${tree}`
+  const treeRels = rels.slice(0, TREE_LIMIT)
+  const tree = treeRels.map(r => `- ${r}`).join("\n")
+  const treeHeader = `PROJECT FILE TREE (${rels.length} files, showing ${treeRels.length}):\n${tree}`
 
-  if (queryWords.length === 0) return treeHeader
-
-  const scored = []
+  const ranked = []
   for (let i = 0; i < files.length; i++) {
     const full = files[i]
     let stat
@@ -86,14 +97,26 @@ export async function getProjectContext(cwd, query) {
     if (stat.size > MAX_FILE_BYTES) continue
     let content
     try { content = fs.readFileSync(full, "utf-8") } catch { continue }
-    const s = scoreFile(content, rels[i].toLowerCase(), queryWords)
-    if (s > 0) scored.push({ rel: rels[i], content, score: s })
+
+    const rel = rels[i]
+    const base = path.basename(rel).toLowerCase()
+    const priorityBoost = PRIORITY_FILES.has(base) ? 1_000_000 : 0
+    const depthPenalty = (rel.match(/[\/\\]/g) || []).length
+    const keywordScore = queryWords.length > 0
+      ? scoreFile(content, rel.toLowerCase(), queryWords)
+      : 0
+
+    ranked.push({
+      rel,
+      content,
+      score: priorityBoost + keywordScore * 10 - depthPenalty
+    })
   }
 
-  scored.sort((a, b) => b.score - a.score)
+  ranked.sort((a, b) => b.score - a.score)
 
-  let context = treeHeader + "\n\nRELEVANT FILES:\n"
-  for (const { rel, content } of scored) {
+  let context = treeHeader + "\n\nPROJECT FILES:\n"
+  for (const { rel, content } of ranked) {
     const block = `\n--- ${rel} ---\n${content}\n`
     if (context.length + block.length > MAX_CONTEXT_CHARS) break
     context += block

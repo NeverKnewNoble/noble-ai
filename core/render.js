@@ -7,11 +7,19 @@ const primary = chalk.hex("#4FC3F7")
 const secondary = chalk.hex("#81D4FA")
 const dim = chalk.gray
 
+function highlightCode(code, lang) {
+  try {
+    return highlight(code, { language: lang || "plaintext", ignoreIllegals: true })
+  } catch {
+    return code
+  }
+}
+
 marked.use(
   markedTerminal({
     reflowText: false,
     tab: 2,
-    code: chalk.cyan,
+    code: (code, lang) => highlightCode(code, lang),
     blockquote: dim.italic,
     heading: primary.bold,
     firstHeading: primary.bold,
@@ -30,33 +38,33 @@ marked.use(
 
 const FILE_BLOCK = /<<<FILE:[^>\n]+>>>\r?\n[\s\S]*?\r?\n<<<END>>>/g
 
-function highlightFences(md) {
-  return md.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
-    try {
-      const out = highlight(code, { language: lang || "plaintext", ignoreIllegals: true })
-      return "```\n" + out + "```"
-    } catch {
-      return "```\n" + code + "```"
-    }
-  })
-}
-
 function indent(text, prefix, contLeader) {
   const lines = text.split("\n")
   return lines
-    .map((line, i) => (i === 0 ? prefix + line : contLeader + line))
+    .map((line, i) => {
+      if (i === 0) return prefix + line
+      if (line.trim() === "") return ""
+      return contLeader + line
+    })
     .join("\n")
+}
+
+function tighten(text) {
+  return text
+    .split("\n")
+    .map(line => line.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
 }
 
 export function renderAssistant(raw) {
   const stripped = raw.replace(FILE_BLOCK, "").trim()
   if (!stripped) return ""
 
-  const highlighted = highlightFences(stripped)
-  const rendered = marked.parse(highlighted).trimEnd()
-
+  const rendered = tighten(marked.parse(stripped))
   const body = indent(rendered, primary("☻ "), "  ")
-  return "\n" + body + "\n"
+  return "\n" + body + "\n\n"
 }
 
 export function renderEditSummary(edits) {

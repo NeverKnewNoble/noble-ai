@@ -5,10 +5,25 @@ const snapshots = []
 
 const EDIT_REGEX = /<<<FILE:\s*([^\n>]+?)>>>\r?\n([\s\S]*?)\r?\n<<<END>>>/g
 
+// Fallback: smaller models (qwen2.5-coder, deepseek-coder) ignore the
+// <<<FILE>>> instruction and emit markdown-style blocks like:
+//   ### File: `index.html`
+//   ```html
+//   ...
+//   ```
+// We recognize that format too so files still get written.
+const MD_FILE_REGEX = /(?:#{1,6}\s+(?:\*\*)?File:(?:\*\*)?|\*\*File:)\s*`([^`\n]+)`(?:\*\*)?\s*\n+```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n```/g
+
 export function parseEdits(text) {
   const edits = []
   let m
+
   while ((m = EDIT_REGEX.exec(text)) !== null) {
+    edits.push({ path: m[1].trim(), content: m[2] })
+  }
+  if (edits.length > 0) return edits
+
+  while ((m = MD_FILE_REGEX.exec(text)) !== null) {
     edits.push({ path: m[1].trim(), content: m[2] })
   }
   return edits

@@ -42,9 +42,14 @@ export async function renderHeader() {
   )
 
   console.log("")
+  console.log(chalk.cyan("☻ Hey! What can I help you with?"))
   console.log(
-    chalk.cyan("☻ Hey! What can I help you with?") +
-    chalk.gray("  Type ? or /help for shortcuts")
+    chalk.gray("  ") +
+    chalk.gray("? or /help for commands") +
+    chalk.gray("  ·  ") +
+    chalk.gray("@path") + chalk.cyan("<TAB>") + chalk.gray(" to attach files") +
+    chalk.gray("  ·  ") +
+    chalk.gray("Ctrl+D to cancel")
   )
   console.log("")
 }
