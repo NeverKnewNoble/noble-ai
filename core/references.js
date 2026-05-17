@@ -1,5 +1,6 @@
 import fs from "fs"
 import path from "path"
+import { shouldSkipName } from "./ignore.js"
 
 const AT_REGEX = /(?<=^|\s)@([^\s@]+)/g
 
@@ -8,12 +9,10 @@ const MAX_DIR_FILES = 20
 const MAX_DIR_BYTES = 80_000
 const MAX_BASENAME_MATCHES = 5
 const MAX_GLOB_MATCHES = 50
+const MAX_URL_BYTES = 200_000
+const URL_FETCH_TIMEOUT_MS = 8_000
 
-const SKIP_DIRS = new Set([
-  "node_modules", "dist", "build", "out", "target", "coverage",
-  ".git", ".next", ".nuxt", ".cache", ".turbo", ".parcel-cache",
-  "__pycache__", ".venv", "venv", ".pytest_cache"
-])
+function isUrl(s) { return /^https?:\/\//i.test(s) }
 
 function hasGlob(s) { return /[*?]/.test(s) }
 
@@ -34,7 +33,7 @@ function findByBasename(cwd, basename) {
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
     for (const e of entries) {
       if (e.name.startsWith(".") && e.name !== basename) continue
-      if (SKIP_DIRS.has(e.name)) continue
+      if (shouldSkipName(e.name)) continue
       const full = path.join(dir, e.name)
       if (e.isDirectory()) walk(full)
       else if (e.isFile() && e.name === basename) matches.push(full)
@@ -64,7 +63,7 @@ function expandGlob(pattern, cwd) {
       let entries
       try { entries = fs.readdirSync(currentAbs, { withFileTypes: true }) } catch { return }
       for (const e of entries) {
-        if (e.name.startsWith(".") || SKIP_DIRS.has(e.name)) continue
+        if (e.name.startsWith(".") || shouldSkipName(e.name)) continue
         if (!e.isDirectory()) continue
         const nextRel = currentRel ? `${currentRel}/${e.name}` : e.name
         walk(path.join(currentAbs, e.name), nextRel, partsIdx)
@@ -81,7 +80,7 @@ function expandGlob(pattern, cwd) {
       let entries
       try { entries = fs.readdirSync(currentAbs, { withFileTypes: true }) } catch { return }
       for (const e of entries) {
-        if (e.name.startsWith(".") || SKIP_DIRS.has(e.name)) continue
+        if (e.name.startsWith(".") || shouldSkipName(e.name)) continue
         if (regex.test(e.name)) {
           const nextRel = currentRel ? `${currentRel}/${e.name}` : e.name
           walk(path.join(currentAbs, e.name), nextRel, partsIdx + 1)
@@ -107,7 +106,7 @@ function listDirFiles(dirAbs, cwd) {
     try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
     for (const e of entries) {
       if (files.length >= MAX_DIR_FILES) return
-      if (e.name.startsWith(".") || SKIP_DIRS.has(e.name)) continue
+      if (e.name.startsWith(".") || shouldSkipName(e.name)) continue
       const full = path.join(d, e.name)
       if (e.isDirectory()) walk(full)
       else if (e.isFile()) files.push(path.relative(cwd, full))
@@ -128,6 +127,11 @@ export function extractReferences(input, cwd = process.cwd()) {
     const raw = m[1].replace(/[.,;!?)\]]+$/, "")
     if (!raw || seen.has(raw)) continue
     seen.add(raw)
+
+    if (isUrl(raw)) {
+      refs.push({ token: raw, isUrl: true, url: raw })
+      continue
+    }
 
     if (hasGlob(raw)) {
       const matches = expandGlob(raw, cwd)
@@ -200,7 +204,25 @@ function readFileSliced(rel, range, cwd = process.cwd()) {
   return lines.slice(start - 1, end).join("\n")
 }
 
-export function buildReferenceContext(refs, cwd = process.cwd()) {
+async function fetchUrl(url) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), URL_FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, redirect: "follow" })
+    if (!res.ok) return `(HTTP ${res.status} fetching ${url})`
+    const text = await res.text()
+    if (text.length > MAX_URL_BYTES) {
+      return text.slice(0, MAX_URL_BYTES) + `\n\n(truncated at ${MAX_URL_BYTES} bytes)`
+    }
+    return text
+  } catch (err) {
+    return `(fetch error: ${err.message})`
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function buildReferenceContext(refs, cwd = process.cwd()) {
   if (refs.length === 0) return ""
   const blocks = []
   let totalBytes = 0
@@ -208,6 +230,12 @@ export function buildReferenceContext(refs, cwd = process.cwd()) {
   for (const ref of refs) {
     if (ref.error) {
       blocks.push(`@${ref.token}: ${ref.error}`)
+      continue
+    }
+    if (ref.isUrl) {
+      const body = await fetchUrl(ref.url)
+      totalBytes += body.length
+      blocks.push(`--- @${ref.url} ---\n${body}`)
       continue
     }
     const isBulk = ref.isDirectory || ref.isGlob
@@ -259,7 +287,7 @@ export function completeReference(line, cwd = process.cwd()) {
 
   const matches = []
   for (const e of entries) {
-    if (SKIP_DIRS.has(e.name)) continue
+    if (shouldSkipName(e.name)) continue
     if (e.name.startsWith(".") && !stem.startsWith(".")) continue
     if (!e.name.startsWith(stem)) continue
     const suffix = e.isDirectory() ? "/" : ""

@@ -46,12 +46,44 @@ The markers are LITERAL TEXT — do NOT wrap them in backticks or code fences.
 
 The path MUST be in backticks. The fenced code block MUST immediately follow.
 
+═══ COMMON MISTAKE — THIS DOES NOT SAVE A FILE ═══
+
+Putting "// File: path" INSIDE the code block is WRONG. The parser ignores it
+and NO FILE WILL BE WRITTEN. The user will see your code but their disk will be
+unchanged, and they will (rightfully) say "you didn't create the file."
+
+  WRONG (will NOT save):
+    \`\`\`javascript
+    // File: foo.js          ← just a comment in the code, parser can't see it
+    console.log("hi")
+    \`\`\`
+
+  RIGHT (will save):
+    ### File: \`foo.js\`
+    \`\`\`javascript
+    console.log("hi")
+    \`\`\`
+
+  ALSO RIGHT (preferred):
+    <<<FILE: foo.js>>>
+    console.log("hi")
+    <<<END>>>
+
+The path goes OUTSIDE and ABOVE the fenced block, as a heading or as a literal
+<<<FILE>>> marker. Never put it inside as a comment.
+
 ═══ DO NOT ═══
 - Do NOT show the same file in BOTH formats — pick one.
 - Do NOT write code in a fenced block without a "### File: \`path\`" heading
-  directly above it — bare code blocks are NOT saved to disk.
+  directly above it (or <<<FILE>>> markers around it) — bare code blocks are
+  NOT saved to disk.
+- Do NOT put the path INSIDE the code block as a "// File:" or "# File:"
+  comment — that does not work.
 - Do NOT say "save this to X" or "create a file named X" — that does nothing.
   Use one of the formats above.
+- Do NOT claim "this file is now created" or "I have created the file" —
+  Noble AI writes the file only AFTER the user approves. The file does not
+  exist yet at the moment you reply. Say "I'll create it" instead.
 - Do NOT include diffs, snippets, or partial files. Always include the COMPLETE
   new file contents.
 
@@ -152,7 +184,7 @@ function contentIsOnlyToolCall(content, calls) {
   return stripped.length === 0 || /^\{[\s\S]*\}$/.test(stripped)
 }
 
-export async function askModel(messages, onStatus = () => {}, onChunk = () => {}) {
+export async function askModel(messages, onStatus = () => {}, onChunk = () => {}, toolCtx = {}) {
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     if (i > 0) onStatus("thinking...")
 
@@ -202,7 +234,7 @@ export async function askModel(messages, onStatus = () => {}, onChunk = () => {}
 
       onStatus(`${name}(${summarizeArgs(parsed)})...`)
 
-      const result = await executeTool(name, parsed)
+      const result = await executeTool(name, parsed, toolCtx)
       messages.push({
         role: "tool",
         tool_name: name,

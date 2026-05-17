@@ -1,17 +1,29 @@
 import fs from "fs"
 import path from "path"
+import { spawn } from "child_process"
+import { getIgnore } from "./ignore.js"
 
 const ROOT = process.cwd()
-
-const SKIP_DIRS = new Set([
-  "node_modules", "dist", "build", "out", "target", "coverage",
-  ".git", ".next", ".nuxt", ".cache", ".turbo", ".parcel-cache",
-  "__pycache__", ".venv", "venv", ".pytest_cache"
-])
 
 const MAX_FILE_BYTES = 200_000
 const MAX_GREP_MATCHES = 80
 const MAX_DIR_ENTRIES = 200
+const MAX_SHELL_STDOUT = 16_000
+const MAX_SHELL_STDERR = 8_000
+const DEFAULT_SHELL_TIMEOUT_MS = 60_000
+
+// Commands that are safe to run without prompting. The match is against the
+// raw command string after collapsing whitespace. Add to this conservatively —
+// anything destructive must require a confirm.
+const DEFAULT_ALLOWLIST = [
+  /^ls(\s|$)/, /^pwd$/, /^echo\s/, /^date$/, /^whoami$/, /^uname(\s|$)/,
+  /^cat\s/, /^head\s/, /^tail\s/, /^wc\s/, /^find\s/,
+  /^which\s/, /^type\s/, /^file\s/, /^stat\s/,
+  /^git\s+(status|log|diff|branch|show|rev-parse|config\s+--get|remote(\s+-v)?)\b/,
+  /^node\s+(-v|--version)$/,
+  /^npm\s+(-v|--version|list|ls|view|search|outdated|--help)\b/,
+  /^npx\s+(--version|-v|-h|--help)\b/
+]
 
 function resolveSafe(rel) {
   const full = path.resolve(ROOT, rel || ".")
@@ -46,8 +58,9 @@ function listDir(rel) {
   const stat = fs.statSync(full)
   if (!stat.isDirectory()) return `Not a directory: ${rel}`
 
+  const ignore = getIgnore(ROOT)
   const entries = fs.readdirSync(full, { withFileTypes: true })
-    .filter(e => !e.name.startsWith(".") && !SKIP_DIRS.has(e.name))
+    .filter(e => !e.name.startsWith(".") && !ignore.skipName(e.name))
     .slice(0, MAX_DIR_ENTRIES)
     .map(e => (e.isDirectory() ? `${e.name}/` : e.name))
 
@@ -68,7 +81,7 @@ function grep(pattern, rel) {
   return results.join("\n")
 }
 
-function walkSearch(dir, regex, results) {
+function walkSearch(dir, regex, results, ignore = getIgnore(ROOT)) {
   if (results.length >= MAX_GREP_MATCHES) return
 
   let stat
@@ -80,11 +93,40 @@ function walkSearch(dir, regex, results) {
 
   for (const entry of entries) {
     if (results.length >= MAX_GREP_MATCHES) return
-    if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue
+    if (entry.name.startsWith(".") || ignore.skipName(entry.name)) continue
     const full = path.join(dir, entry.name)
-    if (entry.isDirectory()) walkSearch(full, regex, results)
+    if (entry.isDirectory()) walkSearch(full, regex, results, ignore)
     else if (entry.isFile()) searchFile(full, regex, results)
   }
+}
+
+function isAllowlisted(command, extraAllowlist = []) {
+  const norm = command.trim().replace(/\s+/g, " ")
+  for (const re of DEFAULT_ALLOWLIST) if (re.test(norm)) return true
+  for (const re of extraAllowlist) if (re.test(norm)) return true
+  return false
+}
+
+function runShell(command, { timeout = DEFAULT_SHELL_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    const proc = spawn(command, [], { shell: true, cwd: ROOT })
+    let stdout = ""
+    let stderr = ""
+    let killed = false
+    const timer = setTimeout(() => { killed = true; proc.kill("SIGTERM") }, timeout)
+
+    proc.stdout.on("data", c => { if (stdout.length < MAX_SHELL_STDOUT) stdout += c.toString() })
+    proc.stderr.on("data", c => { if (stderr.length < MAX_SHELL_STDERR) stderr += c.toString() })
+    proc.on("error", err => { clearTimeout(timer); resolve(`error: ${err.message}`) })
+    proc.on("exit", (code, signal) => {
+      clearTimeout(timer)
+      const parts = [`$ ${command}`, `exit: ${code ?? signal ?? "?"}`]
+      if (killed) parts.push(`(killed after ${timeout}ms)`)
+      if (stdout.length) parts.push(`--- stdout ---\n${stdout.slice(0, MAX_SHELL_STDOUT)}${stdout.length >= MAX_SHELL_STDOUT ? "\n…(truncated)" : ""}`)
+      if (stderr.length) parts.push(`--- stderr ---\n${stderr.slice(0, MAX_SHELL_STDERR)}${stderr.length >= MAX_SHELL_STDERR ? "\n…(truncated)" : ""}`)
+      resolve(parts.join("\n"))
+    })
+  })
 }
 
 function searchFile(full, regex, results) {
@@ -165,6 +207,38 @@ builtins.set("grep", {
   handler: (args) => grep(args.pattern, args.path)
 })
 
+builtins.set("run", {
+  needsConfirm: true,
+  def: {
+    type: "function",
+    function: {
+      name: "run",
+      description: "Execute a shell command in the project root. Use this to run tests, linters, build scripts, package managers, or inspect the environment. Destructive commands (rm, git push, npm publish, etc.) will be blocked unless the user approves. Output is captured and returned.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "The shell command to run, e.g. 'npm test' or 'git status'." }
+        },
+        required: ["command"]
+      }
+    }
+  },
+  handler: async (args, ctx = {}) => {
+    const command = (args.command || "").trim()
+    if (!command) return "Error: missing command"
+
+    const allowed = isAllowlisted(command, ctx.extraAllowlist || [])
+    if (!allowed && ctx.confirm) {
+      const decision = await ctx.confirm(command)
+      if (decision === "deny") return "(user denied execution)"
+      // decision is "allow" | "always" — either way, run it
+    } else if (!allowed && !ctx.confirm) {
+      return "(blocked: command not allowlisted and no confirm handler available)"
+    }
+    return runShell(command)
+  }
+})
+
 export function registerMCPTools(clients) {
   for (const client of clients) {
     for (const tool of client.tools) {
@@ -189,10 +263,10 @@ export function getToolDefs() {
   return defs
 }
 
-export async function executeTool(name, rawArgs) {
+export async function executeTool(name, rawArgs, ctx = {}) {
   const args = typeof rawArgs === "string" ? safeJson(rawArgs) : (rawArgs || {})
   try {
-    if (builtins.has(name)) return await builtins.get(name).handler(args)
+    if (builtins.has(name)) return await builtins.get(name).handler(args, ctx)
     if (mcpRoutes.has(name)) {
       const { client, originalName } = mcpRoutes.get(name)
       return await client.callTool(originalName, args)
@@ -201,4 +275,8 @@ export async function executeTool(name, rawArgs) {
   } catch (err) {
     return `Error (${name}): ${err.message}`
   }
+}
+
+export function toolNeedsConfirm(name) {
+  return !!builtins.get(name)?.needsConfirm
 }

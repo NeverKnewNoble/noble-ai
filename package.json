@@ -17,6 +17,7 @@
     "boxen": "^8.0.1",
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",
+    "diff": "^9.0.0",
     "dotenv": "^17.4.2",
     "fs": "^0.0.1-security",
     "marked": "^15.0.12",

@@ -1,5 +1,6 @@
 import fs from "fs"
 import path from "path"
+import { getIgnore } from "./ignore.js"
 
 const EXTENSIONS = new Set([
   ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -11,12 +12,6 @@ const EXTENSIONS = new Set([
   ".json", ".yaml", ".yml", ".toml", ".xml",
   ".md", ".mdx",
   ".sql", ".graphql", ".prisma"
-])
-
-const SKIP_DIRS = new Set([
-  "node_modules", "dist", "build", "out", "target", "coverage",
-  ".git", ".next", ".nuxt", ".cache", ".turbo", ".parcel-cache",
-  "__pycache__", ".venv", "venv", ".pytest_cache"
 ])
 
 const STOPWORDS = new Set([
@@ -44,16 +39,16 @@ const MAX_FILE_BYTES = 200_000
 const MAX_CONTEXT_CHARS = 24_000
 const TREE_LIMIT = 120
 
-function walk(dir, files = []) {
+function walk(dir, files = [], ignore = getIgnore()) {
   let entries
   try { entries = fs.readdirSync(dir, { withFileTypes: true }) }
   catch { return files }
 
   for (const entry of entries) {
-    if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue
+    if (entry.name.startsWith(".") || ignore.skipName(entry.name)) continue
     const full = path.join(dir, entry.name)
     if (entry.isDirectory()) {
-      walk(full, files)
+      walk(full, files, ignore)
     } else if (entry.isFile() && EXTENSIONS.has(path.extname(entry.name))) {
       files.push(full)
     }
@@ -77,7 +72,7 @@ function scoreFile(content, pathLower, queryWords) {
 }
 
 export async function getProjectContext(cwd, query) {
-  const files = walk(cwd)
+  const files = walk(cwd, [], getIgnore(cwd))
   const rels = files.map(f => path.relative(cwd, f))
 
   const queryWords = query
