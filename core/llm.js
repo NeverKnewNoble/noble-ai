@@ -12,6 +12,14 @@ const PROJECT_RULES_FILES = ["CLAUDE.md", "NOBLE.md", "AGENTS.md"]
 const BASE_SYSTEM_PROMPT = `
 You are Noble AI, a senior software engineer running in a terminal.
 
+═══ WHEN TO CREATE FILES ═══
+ONLY create or edit files when the user EXPLICITLY asks you to build, create,
+make, write, add, implement, edit, scaffold, or change something. For greetings
+("hey", "hi"), small talk, or questions, reply with ONE short, friendly sentence
+and NO file blocks. NEVER invent or write a file the user did not ask for. If the
+user just says "hey", reply like "Hey! What would you like to build or work on?"
+— do not create anything.
+
 ═══ TOOLS ═══
 Call these via the model's native tool-calling. NEVER write a tool call as
 plain text, as JSON in a code block, or as prose like "let me list_dir(.)"
@@ -192,12 +200,6 @@ function extractTextToolCalls(content) {
   return calls
 }
 
-function contentIsOnlyToolCall(content, calls) {
-  if (calls.length === 0) return false
-  const stripped = content.replace(/```[\s\S]*?```/g, "").trim()
-  return stripped.length === 0 || /^\{[\s\S]*\}$/.test(stripped)
-}
-
 export async function askModel(messages, onStatus = () => {}, onChunk = () => {}, toolCtx = {}) {
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     if (i > 0) onStatus("thinking...")
@@ -228,7 +230,14 @@ export async function askModel(messages, onStatus = () => {}, onChunk = () => {}
       }
     }
 
-    const textCalls = toolCalls.length === 0 ? extractTextToolCalls(content) : []
+    // Weak models often emit a tool call as plain-text JSON (with narration
+    // around it) instead of using native tool-calling. Only treat such JSON as a
+    // real call when it names a tool we actually have — then run it instead of
+    // dumping the raw JSON at the user. The sanitizer hides the JSON line itself.
+    const knownTools = new Set(getToolDefs().map(d => d.function?.name))
+    const textCalls = toolCalls.length === 0
+      ? extractTextToolCalls(content).filter(c => knownTools.has(c.function?.name))
+      : []
     const allCalls = toolCalls.length > 0 ? toolCalls : textCalls
 
     const assistantMsg = { role: "assistant", content }
@@ -236,10 +245,6 @@ export async function askModel(messages, onStatus = () => {}, onChunk = () => {}
     messages.push(assistantMsg)
 
     if (allCalls.length === 0) return content
-
-    if (textCalls.length > 0 && !contentIsOnlyToolCall(content, textCalls)) {
-      return content
-    }
 
     for (const call of allCalls) {
       const name = call.function?.name

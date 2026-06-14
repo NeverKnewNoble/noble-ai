@@ -5,7 +5,7 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { spawn } from "child_process"
-import { getProjectContext } from "./context.js"
+import { getProjectContext, getProjectTree } from "./context.js"
 import { askModel, ollama, buildSystemPrompt } from "./llm.js"
 import { webSearch } from "./search.js"
 import { renderHeader } from "./header.js"
@@ -234,7 +234,9 @@ function newSession() {
     lastResponse: "",
     lastUserInput: "",
     allowlist: [],  // session-level regex allowlist for the `run` tool
-    formatReminder: false  // set when the model described a file instead of writing it
+    formatReminder: false,  // set when the model described a file instead of writing it
+    contextInjected: false, // full project context has been injected once
+    treeInjected: false     // the lightweight file tree has been injected once
   }
 }
 
@@ -364,7 +366,12 @@ function loadSession(name) {
     turnCount: data.turnCount || 0,
     lastResponse: data.lastResponse || "",
     lastUserInput: data.lastUserInput || "",
-    allowlist: []
+    allowlist: [],
+    formatReminder: false,
+    // A resumed conversation already carries its context in the message history;
+    // don't re-inject on the next turn.
+    contextInjected: true,
+    treeInjected: true
   }
 }
 
@@ -491,16 +498,16 @@ async function runTurn(input, session) {
   let editEraseClean = true  // could we fully wipe the streamed prose on entering editMode?
   const SPIN = "thinking... (Ctrl+D to cancel)"
 
-  // Write already-sanitized text to the terminal, starting the "☻ " segment on
+  // Write already-sanitized text to the terminal, starting the "✦ " segment on
   // first output and keeping the row/col counters in sync for the re-render.
   const emit = (out) => {
     if (!out) return
     if (!streaming) {
       if (spinner.isSpinning) spinner.stop()
-      process.stdout.write("\n" + theme.primary("☻ "))
+      process.stdout.write("\n" + theme.primary("✦ "))
       streaming = true
       rowsEmitted = 0
-      cursorCol = 2  // "☻ " occupies 2 columns
+      cursorCol = 2  // "✦ " occupies 2 columns
     }
     for (const ch of out) {
       if (ch === "\n") { rowsEmitted++; cursorCol = 0 }
@@ -566,10 +573,23 @@ async function runTurn(input, session) {
       let userContent = input
       const refContext = await buildReferenceContext(refs, process.cwd())
       if (refContext) userContent += `\n\n--- REFERENCED FILES ---\n${refContext}`
-      if (session.turnCount === 0) {
-        const context = await getProjectContext(process.cwd(), input)
-        const webContext = await webSearch(input)
-        userContent += `\n\n--- PROJECT CONTEXT ---\n${context}\n\n--- WEB SEARCH ---\n${webContext}`
+      // Context injection (each is a one-shot per session, gated by flags rather
+      // than turn number so a leading "hey" doesn't burn it):
+      //  • a project question ("what is this repo?") → just the file tree, so the
+      //    model can describe the project without us dumping whole files it might
+      //    echo back verbatim.
+      //  • otherwise the first substantive request → the full ranked context +
+      //    web search, to seed real work.
+      if (!isTrivialInput(input)) {
+        if (isProjectQuestion(input) && !session.treeInjected) {
+          userContent += `\n\n--- PROJECT FILE TREE ---\n${getProjectTree(process.cwd())}`
+          session.treeInjected = true
+        } else if (!session.contextInjected && !isProjectQuestion(input)) {
+          const context = await getProjectContext(process.cwd(), input)
+          const webContext = await webSearch(input)
+          userContent += `\n\n--- PROJECT CONTEXT ---\n${context}\n\n--- WEB SEARCH ---\n${webContext}`
+          session.contextInjected = true
+        }
       }
       if (session.formatReminder) {
         userContent +=
@@ -647,24 +667,66 @@ async function runTurn(input, session) {
   }
 }
 
+// A straight full-width rule, used to frame the input line above and below.
+function hr() {
+  return theme.primary("─".repeat(process.stdout.columns || 80))
+}
+
+// Greetings / pleasantries that should get a plain conversational reply — no
+// project-context dump, no file creation.
+const TRIVIAL_INPUT =
+  /^\s*(hi+|hey+|hello+|yo|sup|hiya|howdy|good\s+(morning|afternoon|evening|night)|thanks?|thank\s+you|ty|ok(ay)?|cool|nice|great|lol|gg|ping|test|who\s+are\s+you|what\s+can\s+you\s+do)\b[\s.!?]*$/i
+function isTrivialInput(s) {
+  return TRIVIAL_INPUT.test((s || "").trim())
+}
+
+// Did the user actually ask for a file to be created/changed? Gates the
+// missed-edit auto-retry so we never force-write a file the user didn't request.
+function userWantsFile(s) {
+  return /\b(creat|mak(e|ing)|build|writ(e|ing)|add|implement|generat|scaffold|set\s?up|edit|updat|modif|fix|refactor|renam|delet|remov|append|insert|replac)/i.test(s || "")
+}
+
+// Is the user asking ABOUT the project (what it is / how it's structured), as
+// opposed to asking to build something? Triggers a lightweight file-tree inject.
+const PROJECT_QUESTION =
+  /\b(project|repo|repository|codebase|code\s?base|directory\s+structure|file\s+tree|folder\s+structure)\b|\b(what(?:'s| is| does| are)|tell me about|explain|describe|overview of|walk me through|summari[sz]e)\b[^]*\b(this|it|here|repo|project|app|code)\b/i
+function isProjectQuestion(s) {
+  return PROJECT_QUESTION.test(s || "") && !userWantsFile(s)
+}
+
+// A centered "Goodbye" banner framed by rules spanning the terminal width.
+function farewell() {
+  const cols = Math.min(process.stdout.columns || 60, 80)
+  const label = " Goodbye 👋 "
+  const labelW = 12  // visible width (👋 counts as 2 columns)
+  const left = Math.max(0, Math.floor((cols - labelW) / 2))
+  const right = Math.max(0, cols - labelW - left)
+  return theme.primary("─".repeat(left)) + theme.primary.bold(label) + theme.primary("─".repeat(right))
+}
+
 export async function startCLI() {
   await renderHeader()
   let session = newSession()
 
   rl.on("close", () => {
-    console.log(theme.dim("\nGoodbye 👋"))
+    console.log(farewell())
     process.exit(0)
   })
 
   function prompt() {
-    rl.question(theme.primary("❯ "), async (input) => {
-      if (!input.trim()) return prompt()
-      saveHistoryEntry(input)
+    console.log(hr())   // top of the input frame
+    askLine()
+  }
 
-      if (input === "exit") {
-        console.log(theme.dim("\nGoodbye 👋"))
+  function askLine() {
+    rl.question(theme.primary("❯❯") + " ", async (input) => {
+      if (!input.trim()) return askLine()  // reuse the same frame, no new rule
+      if (input.trim() === "exit") {        // the goodbye banner is the closing rule
+        console.log(farewell())
         process.exit(0)
       }
+      console.log(hr())                    // close the frame under what was typed
+      saveHistoryEntry(input)
 
       if (input === "?" || input === "/help") {
         console.log(theme.primary("\nConversation commands:"))
@@ -735,9 +797,11 @@ export async function startCLI() {
           console.log(theme.dim("\nNothing to retry.\n"))
           return prompt()
         }
-        // If the last reply only described the file, remind the model to use a
-        // writable format on the retry.
-        if (looksLikeMissedEdit(session.lastResponse)) session.formatReminder = true
+        // If the user wanted a file and the last reply only described it, remind
+        // the model to use a writable format on the retry.
+        if (userWantsFile(session.lastUserInput) && looksLikeMissedEdit(session.lastResponse)) {
+          session.formatReminder = true
+        }
         const replayInput = session.lastUserInput || stripAppendedContext(popped.content)
         console.log(theme.dim(`\n↻ retrying: `) + theme.secondary(replayInput.split("\n")[0].slice(0, 80)))
         const result = await runTurn(replayInput, session)
@@ -887,7 +951,10 @@ export async function startCLI() {
       if (result.ok) {
         const edits = parseEdits(result.response)
         if (edits.length > 0) return promptForEdits(edits, prompt)
-        if (looksLikeMissedEdit(result.response)) {
+        // Only auto-retry when the user actually asked for a file — otherwise a
+        // model that spontaneously "describes a file" (e.g. for a greeting) would
+        // get nagged into writing something nobody requested.
+        if (userWantsFile(input) && looksLikeMissedEdit(result.response)) {
           // The model described the file instead of emitting a writable block.
           // Roll back the bad turn and retry ONCE with a strong format reminder.
           console.log(theme.dim("\n  (the model described the file instead of writing it — retrying once…)\n"))

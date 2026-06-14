@@ -30,6 +30,9 @@ The orchestrator. This is the file you'll touch most often.
   completion, Ctrl+D cancel, and the one-time `@` hint.
 - `theme` — chalk color helpers (`primary`, `secondary`, `dim`, `success`,
   `error`).
+- Input predicates: `isTrivialInput` (greetings), `userWantsFile` (build/edit
+  intent — gates the auto-retry), `isProjectQuestion` (asking *about* the
+  project — triggers the file-tree inject).
 - `HISTORY_FILE`, `SESSIONS_DIR`, `SLASH_COMMANDS`.
 
 ### Turn lifecycle
@@ -39,6 +42,13 @@ The orchestrator. This is the file you'll touch most often.
   Ollama-specific hints (e.g. "is `ollama serve` running?"). If
   `session.formatReminder` is set, it appends a strong "actually write the file"
   instruction to this turn's message and clears the flag.
+- **Context injection** (inside `runTurn`, flag-gated so a leading "hey" can't
+  burn it):
+  - `isTrivialInput(input)` (greetings/pleasantries) → inject nothing.
+  - `isProjectQuestion(input)` ("what is this repo?", not a build) → inject just
+    the file tree (`getProjectTree`) once, guarded by `session.treeInjected`.
+  - otherwise the first substantive request → full `getProjectContext` + web
+    search once, guarded by `session.contextInjected`.
 - **Streaming internals** (closures inside `runTurn`): `emit(out)` writes
   sanitized text and tracks rows/cols for the re-render; the text first passes
   through `createStreamSanitizer()` so edit blocks never appear in the prose. Once
@@ -52,7 +62,14 @@ The orchestrator. This is the file you'll touch most often.
   error recovery.
 
 ### Prompts & confirmations
-- `prompt()` — the REPL loop; also the slash-command dispatcher.
+- `prompt()` / `askLine()` — the REPL loop. `prompt()` draws the top frame rule
+  (`hr()`, full-width blue) then calls `askLine()`, which reads input via
+  `rl.question` (a blue `❯❯` caret). On submit it draws the bottom rule, so each
+  input is framed; empty Enter re-asks within the same frame. `askLine()` is also
+  the slash-command dispatcher.
+- `hr()` — a full-width blue `─` rule used to frame the input.
+- `farewell()` — the centered "Goodbye 👋" banner (blue rules) printed on `exit`
+  and on `rl` close; it doubles as the closing frame so there's no extra spacing.
 - `promptForEdits(edits, next)` — renders each edit as a card and asks
   Yes / Yes-all / No.
 - `selectFromMenu(question, options)` — arrow-key (↑/↓ or `j`/`k`, or number)
@@ -83,16 +100,20 @@ The orchestrator. This is the file you'll touch most often.
 
 ### Misc helpers
 - `newSession()` — fresh `{ messages:[system], turnCount, lastResponse,
-  lastUserInput, allowlist, formatReminder }`.
+  lastUserInput, allowlist, formatReminder, contextInjected, treeInjected }`.
+  `loadSession` sets `contextInjected`/`treeInjected` to `true` (a resumed
+  conversation already carries its context).
 - `estimateTokens`, `renderBar`, `formatAge`, `copyToClipboard`,
   `makeAllowPattern`.
 - `warnIfMissedEdit(response, session)` — when the model produced no parseable
   edit but clearly meant to (`looksLikeMissedEdit`), prints a heads-up.
-- **Missed-edit auto-retry**: in the interactive `prompt()` handler, if a turn
-  produced no edits but `looksLikeMissedEdit` is true, it rolls back the bad turn
-  (`popLastTurn`), sets `session.formatReminder`, and re-runs `runTurn` **once**
-  with the format reminder. `/retry` sets the same flag when the last reply only
-  described a file.
+- **Missed-edit auto-retry**: in the `askLine()` handler, if a turn produced no
+  edits, **the user actually asked for a file** (`userWantsFile(input)`), and
+  `looksLikeMissedEdit` is true, it rolls back the bad turn (`popLastTurn`), sets
+  `session.formatReminder`, and re-runs `runTurn` **once** with the format
+  reminder. The `userWantsFile` gate prevents force-writing a file for a greeting
+  the model spontaneously "described". `/retry` sets the same flag under the same
+  conditions.
 
 ### Exports
 `startCLI()` (interactive) and `runOneShot(input, { autoApply })` (one prompt).
@@ -120,9 +141,12 @@ The model loop and system prompt.
   - executes tools via `executeTool` and feeds results back as `role:"tool"`
     messages,
   - returns the final assistant text.
-- `extractTextToolCalls` / `contentIsOnlyToolCall` — the fallback that lets
-  weaker models "call" tools by emitting `{ "name": ..., "arguments": ... }`
-  JSON in the body.
+- `extractTextToolCalls` — the fallback that lets weaker models "call" tools by
+  emitting `{ "name": ..., "arguments": ... }` JSON in the body. These are now
+  **executed even when wrapped in narration**, but only if the JSON names a tool
+  that actually exists (`getToolDefs()` names) — so stray illustrative JSON isn't
+  mistaken for a call. The leaked JSON line itself is hidden by `render.js`'s
+  sanitizer, so the user never sees raw tool-call JSON.
 - Re-exports `ollama` so `chat.js` can call `ollama.abort()` for cancellation.
 
 Tuning knobs: `MAX_TOOL_ITERATIONS`, `temperature` (0.3), `num_ctx`
@@ -169,9 +193,10 @@ A minimal [Model Context Protocol](https://modelcontextprotocol.io) client.
 
 ## `core/context.js`
 
-First-turn automatic context selection.
+Automatic context selection.
 
-- `getProjectContext(cwd, query)`:
+- `getProjectContext(cwd, query)` — the full, ranked context for a substantive
+  request:
   1. `walk` the repo for known source `EXTENSIONS`, skipping ignored dirs.
   2. Build a truncated file **tree** (up to `TREE_LIMIT` = 120).
   3. Tokenize the prompt into keywords (minus `STOPWORDS`).
@@ -179,6 +204,9 @@ First-turn automatic context selection.
      `PRIORITY_FILES` (README, package manifests, configs), a small depth
      penalty.
   5. Pack the top-ranked files into a block until `MAX_CONTEXT_CHARS` (24k).
+- `getProjectTree(cwd)` — a **lightweight** snapshot: just the file tree, no file
+  contents. Injected for project questions so the model can describe the project
+  without us dumping whole files it might echo back verbatim.
 
 Tuning knobs: `EXTENSIONS`, `PRIORITY_FILES`, `STOPWORDS`, `MAX_CONTEXT_CHARS`,
 `TREE_LIMIT`, `MAX_FILE_BYTES`.
@@ -237,15 +265,16 @@ Parsing and writing file edits.
 Terminal rendering.
 
 - `renderAssistant(raw)` — strips **all** file-edit blocks (`<<<FILE>>>`,
-  `### File:`, and inline `// File:` formats), renders the rest as markdown via
-  `marked` + `marked-terminal`, with `cli-highlight` for code, and indents it
-  under a `☻ ` prefix. The contents only ever appear in the review card.
+  `### File:`, and inline `// File:` formats) **and** leaked plain-text tool-call
+  JSON (`TOOL_CALL_JSON`), renders the rest as markdown via `marked` +
+  `marked-terminal`, with `cli-highlight` for code, and indents it under a `✦ `
+  prefix. The edit contents only ever appear in the review card.
 - `createStreamSanitizer()` — a stateful, line-buffered filter that removes those
-  same edit blocks from the **live token stream** as it arrives, so file contents
-  never scroll by in the prose before the card shows them. Returns
-  `{ push(chunk), flush(), inEditBlock() }`; `inEditBlock()` reports when a file
-  block has started so `runTurn` can keep the spinner up instead of streaming the
-  (hidden) code. Used by `runTurn` in `core/chat.js`.
+  same edit blocks **and** tool-call JSON lines from the **live token stream** as
+  it arrives, so neither file contents nor raw tool-call JSON scroll by in the
+  prose. Returns `{ push(chunk), flush(), inEditBlock() }`; `inEditBlock()`
+  reports when a file block has started so `runTurn` can keep the spinner up
+  instead of streaming the (hidden) code. Used by `runTurn` in `core/chat.js`.
 - `renderFileCard(edit, cwd)` — the **edit review card**: `⏺ Write(path)` header,
   a solid rule, `Create file` / path, a dashed rule, then a syntax-highlighted
   **line-numbered listing** (new files) or a **numbered `+/-` diff** (edits).
@@ -284,13 +313,31 @@ active model is set here. `core/llm.js` reads `state.model`; `/model` writes it.
 
 `webSearch(query)` — POSTs to the Tavily API with `TAVILY_API_KEY` (loaded via
 `dotenv`), returns the top results formatted as text, or a failure string. Called
-once on the first turn.
+once, alongside the full project context, on the first substantive request.
 
 ---
 
 ## `core/header.js`
 
-`renderHeader()` — clears the screen and prints the boxed banner (via `boxen`):
-active model, active RAM (via `systeminformation`), current git branch, project
-name, and shortened path, followed by the greeting and hint line.
-</content>
+`renderHeader()` — clears the screen and prints the startup banner:
+- a solid-blue ANSI-shadow **"NOBLE AI" logo** (`LOGO`), with a compact
+  `✦ N O B L E  A I ✦` fallback when the terminal is too narrow (`renderLogo`);
+- a tagline + version (read live from `package.json` via `version()`);
+- a rounded status panel (via `boxen`): active model, RAM (`systeminformation`),
+  git branch, project, and a left-truncated path (`shortPath`);
+- the `✦` greeting and the key-hint line.
+
+---
+
+## `core/ui.js`
+
+The brand layer — the single place to reskin the UI.
+
+- `BRAND` — the palette stops (currently a blue family). `c` — named chalk
+  helpers (`primary`, `accent`, `label`, `value`, `dim`, `faint`).
+- `gradient(text, stops?, width?)` / `sampleGradient(stops, t)` — left-to-right
+  gradient colorizers. Available for reuse, though the current UI is solid blue.
+
+`core/chat.js`'s `theme` and `core/header.js` both draw from this blue palette,
+so changing `BRAND` / `c` reskins the header, the input frame, the `❯❯` caret,
+the `✦` assistant prefix, and the goodbye banner together.

@@ -9,7 +9,7 @@ unlocks behavior.
 | Variable | Default | Effect | Read in |
 | --- | --- | --- | --- |
 | `NOBLE_NUM_CTX` | `8192` | Ollama context window in tokens. Lower it (e.g. `4096`) if a small model OOMs. | `core/llm.js`, shown by `/tokens` |
-| `TAVILY_API_KEY` | *(none)* | Enables web search on the first turn. Without it, `webSearch` returns nothing. | `core/search.js` (via `.env`) |
+| `TAVILY_API_KEY` | *(none)* | Enables web search on the first substantive turn. Without it, `webSearch` returns nothing. | `core/search.js` (via `.env`) |
 
 `.env` in the project root is loaded by `dotenv` (imported in `core/search.js`).
 Example:
@@ -101,4 +101,3 @@ re-prompt. The allowlist is per-session and is **not** persisted.
 - **Clipboard** (`/copy`) needs `pbcopy` (macOS), `clip` (Windows), or `xclip`
   (Linux) on `PATH`.
 - **Git** is optional — the header shows `no-git` outside a repo.
-</content>

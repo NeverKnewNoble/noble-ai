@@ -9,6 +9,7 @@ to edit, shows a minimal change, and lists what else to keep in sync.
 - [Change what the model sees (context / references / system prompt)](#4-change-what-the-model-sees)
 - [Add a new file-edit format](#5-add-a-new-file-edit-format)
 - [Add tools from an MCP server (no code)](#6-add-tools-via-mcp-no-code)
+- [Reskin the UI (colors / logo)](#7-reskin-the-ui)
 
 A short checklist for any change is at the [bottom](#testing-your-change).
 
@@ -171,12 +172,17 @@ Don't forget to add a line to the `/help` output so it's discoverable.
 
 Three independent levers:
 
-### a. First-turn auto context — `core/context.js`
-Adjust `getProjectContext`:
+### a. Auto context — `core/context.js`
+Adjust `getProjectContext` (the full ranked context) or `getProjectTree` (the
+lightweight tree for project questions):
 - Add file types in `EXTENSIONS`.
 - Add always-include files to `PRIORITY_FILES` (they get a huge score boost).
 - Tune `MAX_CONTEXT_CHARS` (total budget) or `TREE_LIMIT` (tree size).
 - Change `scoreFile` to weight matches differently.
+
+*When* each is injected is decided in `core/chat.js` `runTurn` via `isTrivialInput`
+/ `isProjectQuestion` and the `contextInjected` / `treeInjected` flags — adjust
+those predicates to change what counts as a greeting or a project question.
 
 ### b. Explicit `@references` — `core/references.js`
 This is where `@file`, `@glob`, `@dir`, `@file:10-20`, and `@url` are resolved.
@@ -236,6 +242,29 @@ tools, and `registerMCPTools` exposes them to the model as
 
 ---
 
+## 7. Reskin the UI
+
+All the brand styling lives in **`core/ui.js`** — the palette and colorizers.
+Change it once and the header logo, the input frame (`hr()`), the `❯❯` caret, the
+`✦` assistant prefix, and the goodbye banner all follow.
+
+- **Recolor everything**: edit `BRAND` (gradient stops) and the `c` palette
+  (`primary`, `accent`, `label`, `value`, `dim`, `faint`). `core/chat.js`'s
+  `theme.primary` is the same blue, so rules and accents track it.
+- **Bring back a gradient**: the header is solid blue, but `gradient(text, stops)`
+  still exists — wrap a string with it (note: gradient ANSI can confuse `boxen`
+  title width, so keep box titles solid).
+- **Change the logo**: edit the `LOGO` array in `core/header.js` (ANSI-shadow
+  block font); `renderLogo` also has a compact wordmark fallback for narrow
+  terminals.
+- **Change the assistant glyph** (`✦`): it appears in three places that must stay
+  in sync — the greeting (`core/header.js`), the live stream prefix and the
+  markdown re-render prefix (`core/chat.js` `emit()` and `core/render.js`
+  `renderAssistant`). Keep it a single-width character so the cursor math stays
+  correct.
+
+---
+
 ## Testing your change
 
 There's no test suite yet, so verify manually:
@@ -260,4 +289,3 @@ Checklist:
 - [ ] Edit-format changes are mirrored across `apply.js`, `render.js`, and the
       system prompt in `llm.js`.
 - [ ] Ollama is running (`ollama serve`) before you test a turn.
-</content>

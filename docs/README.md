@@ -44,9 +44,12 @@ Ollama server (and, optionally, MCP tool servers it spawns).
 - **`core/tools.js`** — the tool registry. Built-in tools (`read_file`,
   `list_dir`, `grep`, `run`) plus dynamically-registered MCP tools.
 - **`core/context.js` / `core/references.js`** — what the model gets to *see*:
-  auto-selected project context on turn 1, and explicit `@file` references.
+  auto-selected project context (or a lightweight file tree for project
+  questions) and explicit `@file` references.
 - **`core/apply.js` / `core/render.js`** — parsing the model's file blocks and
   rendering them as review cards / writing them to disk with undo support.
+- **`core/header.js` / `core/ui.js`** — the look: the blue ASCII logo + status
+  banner, and the brand palette that themes the whole UI.
 
 ## Mental model for adding features
 
@@ -67,5 +70,3 @@ Most new capabilities fall into one of four buckets, each with a recipe in
   of the models in `core/models.js` pulled (`ollama pull qwen2.5-coder:7b`).
 - Optional: a `TAVILY_API_KEY` for web search, and `~/.noble/mcp.json` for MCP
   tools.
-</content>
-</invoke>

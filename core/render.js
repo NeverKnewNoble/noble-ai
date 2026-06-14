@@ -46,11 +46,19 @@ const PREFERRED_BLOCK = /^[ \t]*<<<FILE:[^>\n]+>>>[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*
 const MD_BLOCK = /(?:#{1,6}\s+(?:\*\*)?File:(?:\*\*)?|\*\*File:)\s*`[^`\n]+`(?:\*\*)?\s*\n+```[a-zA-Z0-9_+-]*\n[\s\S]*?\n```/g
 const INLINE_BLOCK = /```[a-zA-Z0-9_+-]*\r?\n[ \t]*(?:\/\/|#|--)[ \t]*File:[ \t]*[^\n]+?[ \t]*\r?\n[\s\S]*?\r?\n```/g
 
+// A plain-text tool call the model leaked into prose, e.g.
+//   {"name": "list_dir", "arguments": {"path": "."}}
+// These are executed by the model loop, not meant for the user to read.
+const TOOL_CALL_JSON = /^\s*\{.*"name"\s*:\s*"[^"]+".*"arguments"\s*:.*\}\s*$/
+
 function stripEditBlocks(raw) {
   return raw
     .replace(PREFERRED_BLOCK, "")
     .replace(MD_BLOCK, "")
     .replace(INLINE_BLOCK, "")
+    .split("\n")
+    .filter(line => !TOOL_CALL_JSON.test(line))
+    .join("\n")
 }
 
 function indent(text, prefix, contLeader) {
@@ -78,7 +86,7 @@ export function renderAssistant(raw) {
   if (!stripped) return ""
 
   const rendered = tighten(marked.parse(stripped))
-  const body = indent(rendered, primary("☻ "), "  ")
+  const body = indent(rendered, primary("✦ "), "  ")
   return "\n" + body + "\n\n"
 }
 
@@ -113,6 +121,7 @@ export function createStreamSanitizer() {
       case "normal":
         if (MARK_PREFERRED.test(line)) { mode = "preferred"; return null }
         if (MARK_MD_HEADING.test(line)) { mode = "expectFence"; return null }
+        if (TOOL_CALL_JSON.test(line)) return null  // leaked text tool call — hide it
         if (FENCE.test(line)) { mode = "fenceOpen"; held = line; return null }
         return line
       case "preferred":
@@ -154,7 +163,8 @@ export function createStreamSanitizer() {
     flush() {
       let out = ""
       if (mode === "fenceOpen") out = held + (pending ? "\n" + pending : "")
-      else if (mode === "normal" || mode === "keepFence") out = pending
+      else if (mode === "keepFence") out = pending
+      else if (mode === "normal" && !TOOL_CALL_JSON.test(pending)) out = pending
       // preferred / expectFence / drop: an unterminated edit block — suppress.
       pending = ""; held = ""
       return out

@@ -71,6 +71,16 @@ function scoreFile(content, pathLower, queryWords) {
   return score
 }
 
+// A lightweight project snapshot: just the file tree (no file contents). Used to
+// answer "what is this project?" without dumping whole files the model might echo.
+export function getProjectTree(cwd = process.cwd()) {
+  const files = walk(cwd, [], getIgnore(cwd))
+  const rels = files.map(f => path.relative(cwd, f))
+  const shown = rels.slice(0, TREE_LIMIT)
+  const tree = shown.map(r => `- ${r}`).join("\n")
+  return `PROJECT FILE TREE (${rels.length} files, showing ${shown.length}):\n${tree}`
+}
+
 export async function getProjectContext(cwd, query) {
   const files = walk(cwd, [], getIgnore(cwd))
   const rels = files.map(f => path.relative(cwd, f))
