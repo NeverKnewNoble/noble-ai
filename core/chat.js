@@ -12,7 +12,7 @@ import { renderHeader } from "./header.js"
 import { models } from "./models.js"
 import { state } from "./state.js"
 import { parseEdits, applyEdits, undoLast, looksLikeMissedEdit } from "./apply.js"
-import { renderEditSummary, renderAssistant, renderFileDiff } from "./render.js"
+import { renderEditSummary, renderAssistant, renderFileCard, createStreamSanitizer } from "./render.js"
 import { extractReferences, buildReferenceContext, completeReference } from "./references.js"
 
 const HISTORY_FILE = path.join(os.homedir(), ".noble", "history")
@@ -233,7 +233,8 @@ function newSession() {
     turnCount: 0,
     lastResponse: "",
     lastUserInput: "",
-    allowlist: []  // session-level regex allowlist for the `run` tool
+    allowlist: [],  // session-level regex allowlist for the `run` tool
+    formatReminder: false  // set when the model described a file instead of writing it
   }
 }
 
@@ -262,6 +263,45 @@ function readSingleKey() {
     }
     process.stdin.on("data", onData)
   })
+}
+
+// Arrow-select menu (Claude-Code style). Renders a question and a list of
+// options, lets the user move with ↑/↓ (or type the option number) and confirm
+// with Enter. Returns the selected option's index, or -1 on Ctrl+C / Esc.
+async function selectFromMenu(question, options) {
+  let cur = 0
+
+  const draw = (first) => {
+    if (!first) {
+      // Move back up over the option rows to repaint them in place.
+      readline.moveCursor(process.stdout, 0, -options.length)
+    }
+    for (let i = 0; i < options.length; i++) {
+      readline.clearLine(process.stdout, 0)
+      const marker = i === cur ? theme.primary("❯") : " "
+      const label = i === cur ? theme.primary(`${i + 1}. ${options[i]}`) : `${i + 1}. ${options[i]}`
+      process.stdout.write(` ${marker} ${label}\n`)
+    }
+  }
+
+  process.stdout.write("\n " + theme.primary(question) + "\n")
+  draw(true)
+
+  // Erase the whole menu (blank line + question + option rows) so the prompt
+  // doesn't linger on screen after the user has already chosen.
+  const erase = () => {
+    readline.moveCursor(process.stdout, 0, -(options.length + 2))
+    readline.clearScreenDown(process.stdout)
+  }
+
+  while (true) {
+    const key = await readSingleKey()
+    if (key === "\x1b[A" || key === "k") { cur = (cur - 1 + options.length) % options.length; draw(false) }
+    else if (key === "\x1b[B" || key === "j") { cur = (cur + 1) % options.length; draw(false) }
+    else if (key >= "1" && key <= String(options.length)) { cur = Number(key) - 1; erase(); return cur }
+    else if (key === "\r" || key === "\n") { erase(); return cur }
+    else if (key === "\x03" || key === "\x1b") { erase(); return -1 }
+  }
 }
 
 // Build an allowlist regex from a user-approved command. Match the first 1-2
@@ -339,16 +379,6 @@ function listSessions() {
       })
       .sort((a, b) => b.mtime - a.mtime)
   } catch { return [] }
-}
-
-function countVisualLines(text, cols) {
-  cols = cols || 80
-  let total = 0
-  for (const line of text.split("\n")) {
-    const visible = line.replace(/\x1b\[[0-9;]*m/g, "")
-    total += Math.max(1, Math.ceil(visible.length / cols))
-  }
-  return total
 }
 
 // Rough token estimate. Real tokenization would need a tokenizer; chars/4 is
@@ -443,21 +473,85 @@ async function runTurn(input, session) {
   let spinner = ora({ text: "thinking... (Ctrl+D to cancel)", color: "cyan" }).start()
   let streaming = false
   let lastSegmentText = ""  // raw text from the final stream segment, for markdown re-render
+  // Track rows/columns live during streaming so we know exactly how far back
+  // to walk the cursor when we overwrite with the prettified version. Counting
+  // after the fact (split-on-newline + ceil(len/cols)) underestimated wraps
+  // and left the top of the stream uncleared.
+  let rowsEmitted = 0
+  let cursorCol = 0
+  const streamCols = process.stdout.columns || 80
+  // Strips file-edit blocks out of the live stream so their contents don't
+  // scroll by in the prose (the review card shows them instead).
+  let sanitizer = createStreamSanitizer()
+  // Once the model starts emitting a file-edit block we stop streaming prose and
+  // keep the spinner running until the whole response is done — so the "thinking"
+  // animation stays up right until the review card appears, instead of leaving a
+  // silent gap while the (now-hidden) code is generated.
+  let editMode = false
+  let editEraseClean = true  // could we fully wipe the streamed prose on entering editMode?
+  const SPIN = "thinking... (Ctrl+D to cancel)"
 
-  const onStatus = (text) => {
-    if (streaming) { process.stdout.write("\n"); streaming = false }
-    lastSegmentText = ""  // a tool call ended the previous segment; new one starts fresh
-    if (spinner.isSpinning) spinner.text = text
-    else spinner = ora({ text, color: "cyan" }).start()
-  }
-  const onChunk = (text) => {
+  // Write already-sanitized text to the terminal, starting the "☻ " segment on
+  // first output and keeping the row/col counters in sync for the re-render.
+  const emit = (out) => {
+    if (!out) return
     if (!streaming) {
       if (spinner.isSpinning) spinner.stop()
       process.stdout.write("\n" + theme.primary("☻ "))
       streaming = true
+      rowsEmitted = 0
+      cursorCol = 2  // "☻ " occupies 2 columns
     }
+    for (const ch of out) {
+      if (ch === "\n") { rowsEmitted++; cursorCol = 0 }
+      else if (ch === "\r") { cursorCol = 0 }
+      else {
+        cursorCol++
+        if (cursorCol >= streamCols) { rowsEmitted++; cursorCol = 0 }
+      }
+    }
+    process.stdout.write(out)
+  }
+
+  // Wipe whatever we've streamed for the current segment so it can be re-shown
+  // (prettified) later. Used when an edit block starts mid-prose.
+  const eraseStream = () => {
+    if (!streaming) return
+    readline.cursorTo(process.stdout, 0)
+    if (rowsEmitted > 0) readline.moveCursor(process.stdout, 0, -rowsEmitted)
+    readline.clearScreenDown(process.stdout)
+    streaming = false
+    rowsEmitted = 0
+    cursorCol = 0
+  }
+
+  const onStatus = (text) => {
+    emit(sanitizer.flush())              // flush any held prose from the segment
+    sanitizer = createStreamSanitizer()  // a tool call ends this segment
+    editMode = false
+    if (streaming) { process.stdout.write("\n"); streaming = false }
+    lastSegmentText = ""
+    rowsEmitted = 0
+    cursorCol = 0
+    if (spinner.isSpinning) spinner.text = text
+    else spinner = ora({ text, color: "cyan" }).start()
+  }
+  const onChunk = (text) => {
     lastSegmentText += text
-    process.stdout.write(text)
+    if (editMode) return  // spinner stays up; the prose is rendered at the end
+    emit(sanitizer.push(text))
+    if (sanitizer.inEditBlock()) {
+      // Code is now streaming in (and being hidden). Drop any short intro prose
+      // we showed and keep the spinner animating until the response completes.
+      editMode = true
+      // If the intro is taller than the viewport we can't fully wipe it (cursor
+      // moves clamp at the top), so don't re-render prose at the end or it'll
+      // duplicate. With a well-behaved model the intro is one short line.
+      editEraseClean = rowsEmitted < (process.stdout.rows || 24) - 1
+      eraseStream()
+      if (spinner.isSpinning) spinner.text = SPIN
+      else spinner = ora({ text: SPIN, color: "cyan" }).start()
+    }
   }
   const onConfirm = async (command) => {
     if (spinner.isSpinning) spinner.stop()
@@ -477,6 +571,15 @@ async function runTurn(input, session) {
         const webContext = await webSearch(input)
         userContent += `\n\n--- PROJECT CONTEXT ---\n${context}\n\n--- WEB SEARCH ---\n${webContext}`
       }
+      if (session.formatReminder) {
+        userContent +=
+          "\n\n--- IMPORTANT: ACTUALLY WRITE THE FILE ---\n" +
+          "A previous attempt showed the code but did NOT write the file. You MUST output it as:\n" +
+          "<<<FILE: relative/path>>>\n<the raw file contents>\n<<<END>>>\n" +
+          "Put the RAW contents between the markers — do NOT wrap them in ``` fences, and do NOT " +
+          "show the code as indented or plain text. Keep any prose to one short sentence."
+        session.formatReminder = false
+      }
       session.messages.push({ role: "user", content: userContent })
       session.turnCount++
       session.lastUserInput = input
@@ -486,19 +589,41 @@ async function runTurn(input, session) {
       })
     })
 
-    if (streaming) {
-      // Re-render the final segment as markdown by clearing the raw stream
-      // and printing the prettified version in its place.
-      const cols = process.stdout.columns || 80
-      const lines = countVisualLines("☻ " + lastSegmentText, cols)
-      readline.cursorTo(process.stdout, 0)
-      readline.moveCursor(process.stdout, 0, -(lines - 1))
-      readline.clearScreenDown(process.stdout)
-      const pretty = renderAssistant(lastSegmentText)
-      process.stdout.write(pretty.startsWith("\n") ? pretty.slice(1) : pretty)
+    if (editMode) {
+      // The spinner ran through the whole code generation. Stop it now and print
+      // the prettified prose; the review card follows right after this returns.
+      if (spinner.isSpinning) spinner.stop()
+      if (editEraseClean) {
+        const pretty = renderAssistant(lastSegmentText)
+        if (pretty) process.stdout.write(pretty.startsWith("\n") ? pretty.slice(1) : pretty)
+      } else {
+        process.stdout.write("\n")  // couldn't wipe the streamed intro — don't duplicate it
+      }
       streaming = false
-    } else if (spinner.isSpinning) {
-      spinner.stop()
+    } else {
+      emit(sanitizer.flush())  // emit any prose held back waiting for a newline
+
+      if (streaming) {
+        // Re-render the final segment as prettified markdown — but ONLY when
+        // the raw stream still fits in the viewport. If output has scrolled
+        // past the top, the start of the stream lives in scrollback and
+        // moveCursor will clamp at row 0, leaving the scrolled-off portion
+        // visible above the rerender (which manifests as duplicated output).
+        const viewportRows = process.stdout.rows || 24
+        const canOverwrite = rowsEmitted < viewportRows - 1
+        if (canOverwrite) {
+          readline.cursorTo(process.stdout, 0)
+          if (rowsEmitted > 0) readline.moveCursor(process.stdout, 0, -rowsEmitted)
+          readline.clearScreenDown(process.stdout)
+          const pretty = renderAssistant(lastSegmentText)
+          process.stdout.write(pretty.startsWith("\n") ? pretty.slice(1) : pretty)
+        } else {
+          process.stdout.write("\n\n")
+        }
+        streaming = false
+      } else if (spinner.isSpinning) {
+        spinner.stop()
+      }
     }
 
     session.lastResponse = response
@@ -610,6 +735,9 @@ export async function startCLI() {
           console.log(theme.dim("\nNothing to retry.\n"))
           return prompt()
         }
+        // If the last reply only described the file, remind the model to use a
+        // writable format on the retry.
+        if (looksLikeMissedEdit(session.lastResponse)) session.formatReminder = true
         const replayInput = session.lastUserInput || stripAppendedContext(popped.content)
         console.log(theme.dim(`\n↻ retrying: `) + theme.secondary(replayInput.split("\n")[0].slice(0, 80)))
         const result = await runTurn(replayInput, session)
@@ -759,17 +887,25 @@ export async function startCLI() {
       if (result.ok) {
         const edits = parseEdits(result.response)
         if (edits.length > 0) return promptForEdits(edits, prompt)
-        warnIfMissedEdit(result.response, session)
+        if (looksLikeMissedEdit(result.response)) {
+          // The model described the file instead of emitting a writable block.
+          // Roll back the bad turn and retry ONCE with a strong format reminder.
+          console.log(theme.dim("\n  (the model described the file instead of writing it — retrying once…)\n"))
+          popLastTurn(session)
+          session.formatReminder = true
+          const retry = await runTurn(session.lastUserInput || input, session)
+          if (retry.ok) {
+            const redits = parseEdits(retry.response)
+            if (redits.length > 0) return promptForEdits(redits, prompt)
+            warnIfMissedEdit(retry.response, session)  // give up gracefully
+          }
+        }
       }
       prompt()
     })
   }
 
   async function promptForEdits(edits, next) {
-    console.log(theme.primary(`\nProposed changes (${edits.length} file${edits.length === 1 ? "" : "s"}):`))
-    for (const e of edits) console.log(theme.secondary(`  • ${e.path}`))
-    console.log("")
-
     const accepted = []
     let acceptAll = false
 
@@ -777,20 +913,20 @@ export async function startCLI() {
       const e = edits[i]
       if (acceptAll) { accepted.push(e); continue }
 
-      process.stdout.write(renderFileDiff(e))
+      const full = path.resolve(process.cwd(), e.path)
+      const existed = fs.existsSync(full)
+      const base = path.basename(e.path)
 
-      let decision = null
-      while (decision === null) {
-        process.stdout.write(theme.primary(`[${i + 1}/${edits.length}] `) + theme.dim("[y]es  [n]o  [d]iff again  [a]ll remaining  [s]kip all  > "))
-        const key = (await readSingleKey()).toLowerCase()
-        process.stdout.write(key + "\n")
-        if (key === "y" || key === "\r" || key === "\n") { accepted.push(e); decision = "y" }
-        else if (key === "n") { decision = "n" }
-        else if (key === "a") { accepted.push(e); acceptAll = true; decision = "a" }
-        else if (key === "s") { decision = "s"; i = edits.length }  // break the outer loop
-        else if (key === "d") { process.stdout.write(renderFileDiff(e)) }
-        else if (key === "\x03") { decision = "s"; i = edits.length }  // Ctrl+C → skip
-      }
+      process.stdout.write("\n" + renderFileCard(e))
+
+      const choice = await selectFromMenu(
+        `Do you want to ${existed ? "make this edit to" : "create"} ${base}?`,
+        ["Yes", "Yes, allow all edits during this session", "No"]
+      )
+
+      if (choice === 0) { accepted.push(e) }
+      else if (choice === 1) { accepted.push(e); acceptAll = true }
+      else { /* No / cancel — skip this file */ }
     }
 
     if (accepted.length === 0) {

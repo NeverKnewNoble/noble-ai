@@ -36,12 +36,20 @@ function stripIndent(text, indent) {
   ).join("\n")
 }
 
+// Models sometimes wrap the file body in a single markdown ``` fence *inside*
+// the <<<FILE>>> markers. Those backticks are not part of the file — strip them
+// when the WHOLE body is one fenced block, so we don't write ``` into the file.
+function unwrapFence(text) {
+  const m = text.match(/^[ \t]*```[a-zA-Z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*$/)
+  return m ? m[1] : text
+}
+
 export function parseEdits(text) {
   const edits = []
   let m
 
   while ((m = EDIT_REGEX.exec(text)) !== null) {
-    edits.push({ path: m[2].trim(), content: stripIndent(m[3], m[1]) })
+    edits.push({ path: m[2].trim(), content: unwrapFence(stripIndent(m[3], m[1])) })
   }
   if (edits.length > 0) return edits
 
@@ -59,12 +67,44 @@ export function parseEdits(text) {
 // Heuristic: did the response contain code that LOOKS like it was meant to be
 // a file edit, even though parseEdits couldn't extract one? Used by chat.js
 // to warn the user instead of letting the model silently lie about writing.
+//
+// Be conservative — false positives fire on explanatory answers that quote a
+// path or tell the user "create a .env file in the root of your project", and
+// scare them into thinking the agent failed when it never tried to write.
 export function looksLikeMissedEdit(text) {
   if (!text) return false
+
+  // The model named a specific file it would create/edit (e.g. "I'll create
+  // greeting.js") but emitted no parseable block — it described the file in
+  // prose (often as an indented code block with no markers) instead of writing
+  // it. This only runs when parseEdits already found nothing, so the
+  // false-positive cost is low.
+  const namedFileIntent =
+    /\bI(?:'ll| will|'m going to| am going to|'ve decided to| can)\s+(?:create|make|write|add|build|generate|scaffold|set up)\b[^\n]*?\b[\w/-]+\.[a-z0-9]{1,8}\b/i.test(text)
+  const looksLikeCode =
+    /\b(?:function|const|let|var|class|import|export|def|return|public|private)\b/.test(text) ||
+    /=>/.test(text) ||
+    /^[ \t]{2,}\S[^\n]*[;{}()]\s*$/m.test(text)  // an indented code-ish line
+  if (namedFileIntent && looksLikeCode) return true
+
   const hasFence = /```[\s\S]+?```/.test(text)
-  const claimsCreation = /\b(creat(?:e|ed|ing)|wrote|writing|saved|sav(?:e|ed|ing)|add(?:ed|ing)?|made)\b[\s\S]{0,60}\bfile\b/i.test(text)
-  const hasFileMarker = /(?:\/\/|#|--)\s*File:\s*\S/i.test(text) || /\bFile:\s*[`'"]?[\w./\\-]+/.test(text)
-  return hasFence && (claimsCreation || hasFileMarker)
+  if (!hasFence) return false
+
+  // Strongest signal: the model used a "File: path" marker we should have
+  // recognized but didn't (wrong comment style, malformed heading, etc.).
+  // parseEdits already handles the well-formed cases; if we're here, the
+  // marker is present but in a shape the parser rejected.
+  const hasFileMarker =
+    /(?:\/\/|#|--)\s*File:\s*\S/i.test(text) ||
+    /^[#*]+\s*File:\s*\S/im.test(text)
+  if (hasFileMarker) return true
+
+  // First-person claim of having authored a file. Imperative instructions
+  // to the user ("Create a `.env` file in the root of your project") MUST
+  // NOT match — those are tutorials, not claims of authorship.
+  const firstPersonClaim =
+    /\bI(?:'ve| have)?\s+(?:created|wrote|written|saved|added|generated)\b[^\n]{0,40}\bfile\b/i.test(text)
+  return firstPersonClaim
 }
 
 export function applyEdits(edits, cwd = process.cwd()) {
